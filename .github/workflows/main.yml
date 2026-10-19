@@ -1,0 +1,206 @@
+
+name: ExtNoBrasil PC Virtual - Zorin OS Core
+
+on:
+  workflow_dispatch:
+    inputs:
+      disk_size:
+        description: "Tamanho do disco virtual"
+        required: true
+        type: choice
+        default: "80G"
+        options:
+          - "80G"
+          - "200G"
+          - "500G"
+
+      ram_mb:
+        description: "RAM solicitada em MB"
+        required: true
+        type: choice
+        default: "4096"
+        options:
+          - "4096"
+          - "8192"
+
+      vcpus:
+        description: "vCPUs solicitadas"
+        required: true
+        type: choice
+        default: "2"
+        options:
+          - "2"
+          - "4"
+
+jobs:
+  zorin-vm:
+    name: ExtNoBrasil PC Virtual
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Mostrar detalhes
+        shell: bash
+        run: |
+          echo "ExtNoBrasil PC Virtual [BETA]"
+          echo "Criador: ExtNoBrasil (ExT)"
+          echo "Discord: Brasil_kill0"
+          echo "Sistema pretendido: Zorin OS Core"
+          echo "Acesso futuro: Windows App + XRDP + Tailscale"
+          echo "GPU virtual: VirtIO-GPU"
+          echo "Nenhuma RTX fisica garantida."
+          echo "Recursos do runner nao sao garantidos."
+          nproc
+          free -h
+          df -h /
+
+      - name: Instalar QEMU
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            curl \
+            wget
+
+      - name: Verificar aceleracao
+        shell: bash
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "KVM disponivel no runner."
+            echo "KVM_STATUS=1" >> "$GITHUB_ENV"
+          else
+            echo "KVM nao disponivel; usando TCG."
+            echo "KVM_STATUS=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Baixar ISO do Zorin OS Core
+        shell: bash
+        env:
+          ZORIN_ISO_URL: ${{ secrets.ZORIN_ISO_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ZORIN_ISO_URL" ]; then
+            echo "Configure ZORIN_ISO_URL com uma URL direta e autorizada da ISO oficial."
+            exit 1
+          fi
+
+          mkdir -p "$HOME/extnobrasil"
+          ISO="$HOME/extnobrasil/zorin-core.iso"
+
+          curl -fL --retry 3 \
+            "$ZORIN_ISO_URL" \
+            -o "$ISO"
+
+          if [ "$(stat -c%s "$ISO")" -lt 500000000 ]; then
+            echo "O arquivo parece incompleto ou nao e uma ISO valida."
+            exit 1
+          fi
+
+          file "$ISO"
+          if ! file "$ISO" | grep -qi 'ISO 9660'; then
+            echo "O arquivo baixado nao foi reconhecido como ISO 9660."
+            exit 1
+          fi
+
+          echo "ISO_PATH=$ISO" >> "$GITHUB_ENV"
+
+      - name: Criar disco virtual QCOW2
+        shell: bash
+        env:
+          DISK_SIZE: ${{ inputs.disk_size }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/extnobrasil"
+          DISK="$HOME/extnobrasil/zorin-disk.qcow2"
+
+          qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
+          qemu-img info "$DISK"
+
+          echo "DISK_PATH=$DISK" >> "$GITHUB_ENV"
+
+      - name: Iniciar instalador do Zorin
+        shell: bash
+        env:
+          RAM_MB: ${{ inputs.ram_mb }}
+          VCPUS: ${{ inputs.vcpus }}
+        run: |
+          set -euo pipefail
+
+          if [ "$KVM_STATUS" = "1" ]; then
+            ACCEL="kvm"
+          else
+            ACCEL="tcg"
+          fi
+
+          echo "Aceleracao: $ACCEL"
+          echo "RAM solicitada: $RAM_MB MB"
+          echo "vCPUs solicitadas: $VCPUS"
+          echo "Disco: $DISK_PATH"
+
+          echo "Iniciando VM com console VNC local."
+          echo "Esta etapa ainda nao configura RDP no sistema convidado."
+
+          nohup qemu-system-x86_64 \
+            -name "ExtNoBrasil-Zorin-Core" \
+            -machine "accel=$ACCEL" \
+            -cpu max \
+            -smp "$VCPUS" \
+            -m "$RAM_MB" \
+            -drive "file=$DISK_PATH,format=qcow2,if=virtio" \
+            -cdrom "$ISO_PATH" \
+            -boot order=d \
+            -vga virtio \
+            -display none \
+            -vnc 127.0.0.1:0 \
+            -monitor none \
+            -no-reboot \
+            > "$HOME/extnobrasil/qemu.log" 2>&1 &
+
+          echo "QEMU_PID=$!" >> "$GITHUB_ENV"
+          sleep 10
+
+          if ! kill -0 "$!" 2>/dev/null; then
+            cat "$HOME/extnobrasil/qemu.log"
+            echo "QEMU nao iniciou corretamente."
+            exit 1
+          fi
+
+          echo "VM iniciada. O instalador ainda requer acesso ao console."
+
+      - name: Resumo e limites
+        shell: bash
+        env:
+          RAM_MB: ${{ inputs.ram_mb }}
+          VCPUS: ${{ inputs.vcpus }}
+          DISK_SIZE: ${{ inputs.disk_size }}
+        run: |
+          echo "======================================"
+          echo "ExtNoBrasil PC Virtual [BETA]"
+          echo "Sistema: instalador Zorin OS Core"
+          echo "RAM solicitada: $RAM_MB MB"
+          echo "vCPUs solicitadas: $VCPUS"
+          echo "Disco QCOW2: $DISK_SIZE"
+          echo "GPU: VirtIO virtual"
+          echo "KVM: $KVM_STATUS"
+          echo "Tailscale: ainda nao configurado"
+          echo "Windows App/RDP: ainda nao configurado"
+          echo "======================================"
+          echo "A ISO e o disco sao temporarios neste workflow."
+          echo "Nao ha checkpoint persistente configurado."
+          echo "O instalador requer um console grafico acessivel."
+          echo "Nao exponha VNC ou RDP diretamente na internet."
+
+      - name: Manter VM ativa
+        shell: bash
+        run: |
+          while kill -0 "$QEMU_PID" 2>/dev/null; do
+            echo "[$(date -Is)] VM Zorin em execucao."
+            sleep 60
+          done
+
+          echo "A VM foi encerrada."
+          cat "$HOME/extnobrasil/qemu.log"
