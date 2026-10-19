@@ -1,206 +1,199 @@
-
-name: ExtNoBrasil PC Virtual - Zorin OS Core
+name: "ExtNoBrasil PC Virtual - Windows App + Tailscale"
 
 on:
   workflow_dispatch:
-    inputs:
-      disk_size:
-        description: "Tamanho do disco virtual"
-        required: true
-        type: choice
-        default: "80G"
-        options:
-          - "80G"
-          - "200G"
-          - "500G"
 
-      ram_mb:
-        description: "RAM solicitada em MB"
-        required: true
-        type: choice
-        default: "4096"
-        options:
-          - "4096"
-          - "8192"
-
-      vcpus:
-        description: "vCPUs solicitadas"
-        required: true
-        type: choice
-        default: "2"
-        options:
-          - "2"
-          - "4"
+permissions:
+  contents: read
 
 jobs:
-  zorin-vm:
-    name: ExtNoBrasil PC Virtual
-    runs-on: ubuntu-24.04
+  secure-rdp:
+    name: "Iniciar PC Virtual"
+    runs-on: windows-latest
     timeout-minutes: 350
 
     steps:
-      - name: Mostrar detalhes
-        shell: bash
+      - name: "Configurar Área de Trabalho Remota"
+        shell: pwsh
         run: |
-          echo "ExtNoBrasil PC Virtual [BETA]"
-          echo "Criador: ExtNoBrasil (ExT)"
-          echo "Discord: Brasil_kill0"
-          echo "Sistema pretendido: Zorin OS Core"
-          echo "Acesso futuro: Windows App + XRDP + Tailscale"
-          echo "GPU virtual: VirtIO-GPU"
-          echo "Nenhuma RTX fisica garantida."
-          echo "Recursos do runner nao sao garantidos."
-          nproc
-          free -h
-          df -h /
+          $ErrorActionPreference = "Stop"
 
-      - name: Instalar QEMU
-        shell: bash
+          # Ativar RDP mantendo a autenticação NLA.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          # Permitir RDP somente a partir da faixa IPv4 do Tailscale.
+          Get-NetFirewallRule -DisplayName 'ExtNoBrasil-RDP-Tailscale' `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName 'ExtNoBrasil-RDP-Tailscale' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Manual
+          Start-Service -Name TermService
+
+          Write-Host "Configuração RDP concluída."
+
+      - name: "Criar usuário Skyro"
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            qemu-system-x86 \
-            qemu-utils \
-            curl \
-            wget
+          $ErrorActionPreference = "Stop"
 
-      - name: Verificar aceleracao
-        shell: bash
+          # Gerar uma senha aleatória forte.
+          $bytes = New-Object byte[] 32
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          $rng.GetBytes($bytes)
+          $rng.Dispose()
+
+          $password = [Convert]::ToBase64String($bytes).
+            Replace('+','X').Replace('/','Y').TrimEnd('=')
+
+          $securePassword = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name 'Skyro' -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name 'Skyro'
+          }
+
+          New-LocalUser `
+            -Name 'Skyro' `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -Description 'ExtNoBrasil PC Virtual'
+
+          Add-LocalGroupMember -Group 'Administrators' -Member 'Skyro'
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'Skyro'
+
+          # Disponibilizar a senha no ambiente da etapa de conexão.
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "Usuário Skyro criado."
+
+      - name: "Instalar Tailscale"
+        shell: pwsh
         run: |
-          if [ -e /dev/kvm ]; then
-            echo "KVM disponivel no runner."
-            echo "KVM_STATUS=1" >> "$GITHUB_ENV"
-          else
-            echo "KVM nao disponivel; usando TCG."
-            echo "KVM_STATUS=0" >> "$GITHUB_ENV"
-          fi
+          $ErrorActionPreference = "Stop"
 
-      - name: Baixar ISO do Zorin OS Core
-        shell: bash
+          $installer = "$env:TEMP\tailscale-setup.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $process = Start-Process msiexec.exe `
+            -ArgumentList @('/i', "`"$installer`"", '/quiet', '/norestart') `
+            -Wait -PassThru
+
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Instalação do Tailscale falhou: código $($process.ExitCode)"
+          }
+
+      - name: "Conectar ao Tailscale"
+        shell: pwsh
         env:
-          ZORIN_ISO_URL: ${{ secrets.ZORIN_ISO_URL }}
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          set -euo pipefail
+          $ErrorActionPreference = "Stop"
 
-          if [ -z "$ZORIN_ISO_URL" ]; then
-            echo "Configure ZORIN_ISO_URL com uma URL direta e autorizada da ISO oficial."
-            exit 1
-          fi
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Configure o secret TAILSCALE_AUTH_KEY nas configurações do repositório."
+          }
 
-          mkdir -p "$HOME/extnobrasil"
-          ISO="$HOME/extnobrasil/zorin-core.iso"
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          curl -fL --retry 3 \
-            "$ZORIN_ISO_URL" \
-            -o "$ISO"
+          if (-not (Test-Path $ts)) {
+            throw "O executável do Tailscale não foi encontrado."
+          }
 
-          if [ "$(stat -c%s "$ISO")" -lt 500000000 ]; then
-            echo "O arquivo parece incompleto ou nao e uma ISO valida."
-            exit 1
-          fi
+          & $ts up `
+            "--authkey=$env:TS_AUTHKEY" `
+            "--hostname=extnobrasil-$env:GITHUB_RUN_ID" `
+            "--accept-dns=false"
 
-          file "$ISO"
-          if ! file "$ISO" | grep -qi 'ISO 9660'; then
-            echo "O arquivo baixado nao foi reconhecido como ISO 9660."
-            exit 1
-          fi
+          if ($LASTEXITCODE -ne 0) {
+            throw "Não foi possível conectar ao Tailscale."
+          }
 
-          echo "ISO_PATH=$ISO" >> "$GITHUB_ENV"
+          $ip = $null
+          for ($i = 0; $i -lt 24 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 5
+            $result = & $ts ip -4
+            if ($LASTEXITCODE -eq 0 -and $result) {
+              $ip = ($result | Select-Object -First 1).Trim()
+            }
+          }
 
-      - name: Criar disco virtual QCOW2
-        shell: bash
-        env:
-          DISK_SIZE: ${{ inputs.disk_size }}
+          if (-not $ip) {
+            throw "O Tailscale não atribuiu um endereço IPv4."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale conectado: $ip"
+
+      - name: "Verificar serviço RDP"
+        shell: pwsh
         run: |
-          set -euo pipefail
+          $ErrorActionPreference = "Stop"
 
-          mkdir -p "$HOME/extnobrasil"
-          DISK="$HOME/extnobrasil/zorin-disk.qcow2"
+          $ready = $false
+          for ($i = 0; $i -lt 24; $i++) {
+            $service = Get-Service -Name TermService
+            $test = Test-NetConnection `
+              -ComputerName '127.0.0.1' `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
 
-          qemu-img create -f qcow2 "$DISK" "$DISK_SIZE"
-          qemu-img info "$DISK"
+            if ($service.Status -eq 'Running' -and $test.TcpTestSucceeded) {
+              $ready = $true
+              break
+            }
 
-          echo "DISK_PATH=$DISK" >> "$GITHUB_ENV"
+            Start-Sleep -Seconds 5
+          }
 
-      - name: Iniciar instalador do Zorin
-        shell: bash
-        env:
-          RAM_MB: ${{ inputs.ram_mb }}
-          VCPUS: ${{ inputs.vcpus }}
+          if (-not $ready) {
+            throw "O serviço RDP não abriu a porta 3389."
+          }
+
+          Write-Host "Serviço RDP ativo."
+
+      - name: "Exibir dados de conexão e manter sessão"
+        shell: pwsh
         run: |
-          set -euo pipefail
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " EXT NOBRASIL PC VIRTUAL [BETA]"
+          Write-Host " Criador: ExtNoBrasil (ExT)"
+          Write-Host " Discord: Brasil_kill0"
+          Write-Host " Sistema: Windows do runner GitHub"
+          Write-Host " Acesso: Windows App + Tailscale"
+          Write-Host "----------------------------------------------"
+          Write-Host " Endereço: $env:TAILSCALE_IP"
+          Write-Host " Porta: 3389"
+          Write-Host " Usuário: Skyro"
+          Write-Host " Senha: $env:RDP_PASSWORD"
+          Write-Host "----------------------------------------------"
+          Write-Host " GPU dedicada: não garantida"
+          Write-Host " Aceleração 3D: não garantida"
+          Write-Host " FPS: não garantidos"
+          Write-Host "=============================================="
+          Write-Host ""
 
-          if [ "$KVM_STATUS" = "1" ]; then
-            ACCEL="kvm"
-          else
-            ACCEL="tcg"
-          fi
-
-          echo "Aceleracao: $ACCEL"
-          echo "RAM solicitada: $RAM_MB MB"
-          echo "vCPUs solicitadas: $VCPUS"
-          echo "Disco: $DISK_PATH"
-
-          echo "Iniciando VM com console VNC local."
-          echo "Esta etapa ainda nao configura RDP no sistema convidado."
-
-          nohup qemu-system-x86_64 \
-            -name "ExtNoBrasil-Zorin-Core" \
-            -machine "accel=$ACCEL" \
-            -cpu max \
-            -smp "$VCPUS" \
-            -m "$RAM_MB" \
-            -drive "file=$DISK_PATH,format=qcow2,if=virtio" \
-            -cdrom "$ISO_PATH" \
-            -boot order=d \
-            -vga virtio \
-            -display none \
-            -vnc 127.0.0.1:0 \
-            -monitor none \
-            -no-reboot \
-            > "$HOME/extnobrasil/qemu.log" 2>&1 &
-
-          echo "QEMU_PID=$!" >> "$GITHUB_ENV"
-          sleep 10
-
-          if ! kill -0 "$!" 2>/dev/null; then
-            cat "$HOME/extnobrasil/qemu.log"
-            echo "QEMU nao iniciou corretamente."
-            exit 1
-          fi
-
-          echo "VM iniciada. O instalador ainda requer acesso ao console."
-
-      - name: Resumo e limites
-        shell: bash
-        env:
-          RAM_MB: ${{ inputs.ram_mb }}
-          VCPUS: ${{ inputs.vcpus }}
-          DISK_SIZE: ${{ inputs.disk_size }}
-        run: |
-          echo "======================================"
-          echo "ExtNoBrasil PC Virtual [BETA]"
-          echo "Sistema: instalador Zorin OS Core"
-          echo "RAM solicitada: $RAM_MB MB"
-          echo "vCPUs solicitadas: $VCPUS"
-          echo "Disco QCOW2: $DISK_SIZE"
-          echo "GPU: VirtIO virtual"
-          echo "KVM: $KVM_STATUS"
-          echo "Tailscale: ainda nao configurado"
-          echo "Windows App/RDP: ainda nao configurado"
-          echo "======================================"
-          echo "A ISO e o disco sao temporarios neste workflow."
-          echo "Nao ha checkpoint persistente configurado."
-          echo "O instalador requer um console grafico acessivel."
-          echo "Nao exponha VNC ou RDP diretamente na internet."
-
-      - name: Manter VM ativa
-        shell: bash
-        run: |
-          while kill -0 "$QEMU_PID" 2>/dev/null; do
-            echo "[$(date -Is)] VM Zorin em execucao."
-            sleep 60
-          done
-
-          echo "A VM foi encerrada."
-          cat "$HOME/extnobrasil/qemu.log"
+          # Manter o job ativo até o limite configurado.
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] PC Virtual ativo."
+            Start-Sleep -Seconds 60
+          }
